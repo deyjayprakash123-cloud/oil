@@ -26,7 +26,8 @@ from physics_engine import (
     calculate_rod_load,
     calculate_steam_oil_ratio,
     calculate_pump_efficiency,
-    simulate_css_cycle
+    simulate_css_cycle,
+    generate_dynacard
 )
 from ai_optimizer import (
     optimize_srp_parameters,
@@ -39,7 +40,9 @@ from database import (
     save_simulation,
     get_simulation_history,
     save_alert,
-    get_alerts
+    get_alerts,
+    clear_alerts,
+    clear_simulation_history
 )
 
 # Initialize database
@@ -298,11 +301,20 @@ else:
 # Dynamic Slider Defaults Synchronization
 if "last_selected_well" not in st.session_state or st.session_state.last_selected_well != selected_well_id:
     st.session_state.last_selected_well = selected_well_id
-    st.session_state.steam_vol_input = default_steam
-    st.session_state.spm_input = default_spm
-    st.session_state.stroke_input = default_stroke
-    st.session_state.pump_depth_input = default_pump_depth
+    st.session_state["steam_slider"] = int(default_steam)
+    st.session_state["spm_slider"] = float(default_spm)
+    st.session_state["stroke_slider"] = float(default_stroke)
+    st.session_state["depth_slider"] = float(default_pump_depth)
     st.session_state.optimal_params = None
+
+if "steam_slider" not in st.session_state:
+    st.session_state["steam_slider"] = int(default_steam)
+if "spm_slider" not in st.session_state:
+    st.session_state["spm_slider"] = float(default_spm)
+if "stroke_slider" not in st.session_state:
+    st.session_state["stroke_slider"] = float(default_stroke)
+if "depth_slider" not in st.session_state:
+    st.session_state["depth_slider"] = float(default_pump_depth)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("#### ♨️ CSS Parameters")
@@ -311,8 +323,8 @@ steam_volume = st.sidebar.slider(
     "Steam Injection Volume (bbl)",
     min_value=5000,
     max_value=20000,
-    value=int(st.session_state.steam_vol_input),
     step=500,
+    key="steam_slider",
     help="Cold Water Equivalent (CWE) volume injected to heat the Jodhpur Sandstone heavy oil pay zone."
 )
 
@@ -350,8 +362,8 @@ spm = st.sidebar.slider(
     "Strokes Per Minute (SPM)",
     min_value=4.0,
     max_value=12.0,
-    value=float(st.session_state.spm_input),
     step=0.2,
+    key="spm_slider",
     help="Pumping speed. Excessive SPM in high-viscosity oil leads to severe rod floating and premature fatigue."
 )
 
@@ -359,8 +371,8 @@ stroke_length = st.sidebar.slider(
     "Stroke Length (inches)",
     min_value=40.0,
     max_value=120.0,
-    value=float(st.session_state.stroke_input),
     step=5.0,
+    key="stroke_slider",
     help="Polished rod stroke length. Long slow strokes typically maximize heavy oil pump efficiency."
 )
 
@@ -368,8 +380,8 @@ pump_depth = st.sidebar.slider(
     "Pump Depth (meters)",
     min_value=500.0,
     max_value=1500.0,
-    value=float(st.session_state.pump_depth_input),
     step=10.0,
+    key="depth_slider",
     help="True vertical depth of the subsurface insert/tubing sucker rod pump."
 )
 
@@ -381,8 +393,9 @@ optimize_btn = col_btn2.button("🤖 Auto-AI", use_container_width=True)
 
 if optimize_btn:
     st.session_state.ai_optimized = True
+    eff_visc_85 = calculate_oil_viscosity(85.0, reference_viscosity=oil_visc, reference_temp=res_temp, api_gravity=api_grav)
     best_res = optimize_srp_parameters(
-        current_viscosity=oil_visc * 0.08,
+        current_viscosity=eff_visc_85,
         current_temp=85.0,
         pump_depth=pump_depth,
         api_gravity=api_grav,
@@ -391,7 +404,10 @@ if optimize_btn:
         soak_days=soak_days
     )
     st.session_state.optimal_params = best_res
-    st.sidebar.success(f"AI Selected Optimal: {best_res['optimal_spm']} SPM, {best_res['optimal_stroke_length']}\"")
+    st.session_state["spm_slider"] = float(best_res["optimal_spm"])
+    st.session_state["stroke_slider"] = float(best_res["optimal_stroke_length"])
+    st.sidebar.success(f"Applied Optimal: {best_res['optimal_spm']} SPM, {best_res['optimal_stroke_length']}\"")
+    st.rerun()
 
 
 # ============================================================================
@@ -413,8 +429,8 @@ sim_df = simulate_css_cycle(
 
 # Extract summary metrics
 prod_phase_df = sim_df[sim_df["Phase"] == "Production"]
-cum_oil_produced = float(prod_phase_df["Oil_Production"].sum())
-peak_oil_rate = float(prod_phase_df["Oil_Production"].max())
+cum_oil_produced = float(prod_phase_df["Oil_Production"].sum()) if not prod_phase_df.empty else 0.0
+peak_oil_rate = float(prod_phase_df["Oil_Production"].max()) if not prod_phase_df.empty else 0.0
 final_sor = float(prod_phase_df["SOR"].iloc[-1]) if not prod_phase_df.empty else 0.0
 avg_pump_eff = float(prod_phase_df["Pump_Efficiency"].mean()) if not prod_phase_df.empty else 0.0
 max_pprl = float(prod_phase_df["Rod_Load"].max()) if not prod_phase_df.empty else 0.0
@@ -442,8 +458,57 @@ else:
     pred_increase = 12.0 if current_spm_val > opt_spm else 6.0
     energy_savings = 18.0 if current_spm_val > opt_spm else 8.0
 
-# 7-Day Future Forecast
-forecast_df = predict_future_state(sim_df, days_ahead=7)
+# 7-Day Future Forecast (with well-specific fluid properties)
+forecast_df = predict_future_state(
+    sim_df,
+    days_ahead=7,
+    api_gravity=float(api_grav),
+    ref_viscosity=float(oil_visc),
+    ref_temp=float(res_temp)
+)
+
+
+@st.cache_data
+def get_field_comparison_data():
+    """Cache multi-well comparison simulations for instantaneous rendering."""
+    comparison_records = []
+    for w_id, w_props in WELL_DATABASE.items():
+        w_sim = simulate_css_cycle(
+            steam_volume=12000.0,
+            spm=6.0,
+            stroke_length=80.0,
+            pump_depth=w_props["depth_m"],
+            reservoir_temp=w_props["reservoir_temp_c"],
+            oil_viscosity=w_props["viscosity_cp"],
+            api_gravity=w_props["api_gravity"]
+        )
+        w_prod = w_sim[w_sim["Phase"] == "Production"]
+        peak_bopd = float(w_prod["Oil_Production"].max()) if not w_prod.empty else 0.0
+        avg_bopd = float(w_prod["Oil_Production"].mean()) if not w_prod.empty else 0.0
+        total_bbl = float(w_prod["Oil_Production"].sum()) if not w_prod.empty else 0.0
+
+        if w_props["api_gravity"] < 15.0:
+            rec_spm_str = "4.5 - 5.0"
+        elif w_props["api_gravity"] > 17.5:
+            rec_spm_str = "8.5 - 10.0"
+        else:
+            rec_spm_str = "5.5 - 7.0"
+
+        comparison_records.append({
+            "Well ID": w_id,
+            "Name": w_props["name"],
+            "Depth (m)": w_props["depth_m"],
+            "API Gravity (°)": w_props["api_gravity"],
+            "Viscosity (cP)": w_props["viscosity_cp"],
+            "Reservoir Temp (°C)": w_props["reservoir_temp_c"],
+            "Permeability (mD)": w_props["permeability_md"],
+            "Peak BOPD": np.round(peak_bopd, 1),
+            "Avg BOPD": np.round(avg_bopd, 1),
+            "Cycle Oil (bbl)": np.round(total_bbl, 0),
+            "Safe SPM Range": rec_spm_str
+        })
+    return pd.DataFrame(comparison_records)
+
 
 
 # ============================================================================
@@ -454,11 +519,12 @@ center_col, right_col = st.columns([2.3, 1.0])
 
 with center_col:
     # Tabbed Interface for Core Visualizations
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🌐 Reservoir Thermal Map (3D)",
         "📈 Production & Thermal Curves",
         "⚙️ SRP Dynacard & Mechanics",
-        "📊 Field Comparison"
+        "📊 Field Comparison",
+        "📜 Simulation History & SCADA Log"
     ])
 
     # ------------------------------------------------------------------------
@@ -467,15 +533,20 @@ with center_col:
     with tab1:
         st.markdown(f"#### 3D Wellbore & Steam Chamber ({selected_well_id} | Depth: {pump_depth:.0f}m)")
 
+        max_sim_day = int(sim_df["Day"].iloc[-1]) if not sim_df.empty else 60
+        prod_start_day = int(prod_phase_df["Day"].iloc[0]) if not prod_phase_df.empty else max_sim_day
+        safe_scrub_val = min(max(1, prod_start_day), max_sim_day)
+
         time_step = st.slider(
             "Scrub Simulation Day",
             min_value=1,
-            max_value=int(sim_df["Day"].iloc[-1]),
-            value=int(sim_df[sim_df['Phase'] == 'Production']['Day'].iloc[0] if not prod_phase_df.empty else 20),
+            max_value=max_sim_day,
+            value=safe_scrub_val,
             help="Scrub through the CSS cycle to observe steam chamber heating and cooling around the wellbore."
         )
 
-        curr_record = sim_df[sim_df["Day"] == time_step].iloc[0]
+        matching_rows = sim_df[sim_df["Day"] == time_step]
+        curr_record = matching_rows.iloc[0] if not matching_rows.empty else sim_df.iloc[-1]
         chamber_temp = curr_record["Reservoir_Temp"]
         phase_label = curr_record["Phase"]
 
@@ -668,7 +739,82 @@ with center_col:
     # TAB 3: SRP PERFORMANCE & DYNACARD DIAGNOSTIC
     # ------------------------------------------------------------------------
     with tab3:
-        st.markdown(f"#### Sucker Rod Pump (API RP 11L) Dynamics ({selected_well_id})")
+        st.markdown(f"#### Sucker Rod Pump (API RP 11L) Dynamics & Dynacard Diagnostic ({selected_well_id})")
+
+        # Dynamic Dynacard computation
+        fluid_visc_for_card = float(curr_record["Oil_Viscosity"]) if "curr_record" in locals() and curr_record is not None else float(oil_visc)
+        dynacard = generate_dynacard(
+            stroke_length=float(stroke_length),
+            spm=float(spm),
+            pump_depth=float(pump_depth),
+            rod_diameter=1.0,
+            fluid_viscosity=fluid_visc_for_card,
+            api_gravity=float(api_grav)
+        )
+
+        col_dyna_plot, col_dyna_diag = st.columns([2.2, 1.0])
+
+        with col_dyna_plot:
+            fig_dyna = go.Figure()
+            # Surface Dynacard
+            fig_dyna.add_trace(go.Scatter(
+                x=dynacard["surface_position"],
+                y=dynacard["surface_load"],
+                mode="lines",
+                name="Surface Dynamometer Card",
+                line=dict(color="#F39C12", width=3),
+                fill="toself",
+                fillcolor="rgba(243, 156, 18, 0.12)"
+            ))
+            # Downhole Pump Card
+            fig_dyna.add_trace(go.Scatter(
+                x=dynacard["pump_position"],
+                y=dynacard["pump_load"],
+                mode="lines",
+                name="Downhole Pump Card",
+                line=dict(color="#2ECC71", width=2.5, dash="dash"),
+                fill="toself",
+                fillcolor="rgba(46, 204, 113, 0.10)"
+            ))
+            # API Reference Limits
+            fig_dyna.add_hline(
+                y=22000.0, line_dash="dot", line_color="#E74C3C",
+                annotation_text="API Grade D Safe Stress Limit (22,000 lbs)"
+            )
+            fig_dyna.add_hline(
+                y=0.0, line_dash="dash", line_color="#3498DB",
+                annotation_text="Rod Floating Baseline (0 lbs)"
+            )
+            fig_dyna.update_layout(
+                title=f"API RP 11L Dynamometer Card: Surface vs Downhole Pump ({selected_well_id})",
+                xaxis_title="Polished Rod Position (inches)",
+                yaxis_title="Polished Rod Load (lbs)",
+                template="plotly_dark",
+                paper_bgcolor="#162038",
+                plot_bgcolor="#162038",
+                height=340,
+                margin=dict(l=40, r=20, t=40, b=30),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_dyna, use_container_width=True)
+
+        with col_dyna_diag:
+            diag_badge_class = "alert-banner-danger" if dynacard["is_rod_floating"] or min_mprl <= 0 else ("alert-banner-warning" if dynacard["pprl"] > 22000 else "alert-banner-success")
+            st.markdown(f"""
+            <div class="{diag_badge_class}" style="margin-top: 10px;">
+                <div style="font-size: 11px; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px;">Dynacard Diagnostic</div>
+                <div style="font-size: 14px; font-weight: 700; margin-top: 4px;">{dynacard['diagnostic']}</div>
+            </div>
+            <div style="background: #162038; border: 1px solid #233355; border-radius: 8px; padding: 14px; margin-top: 10px;">
+                <div style="font-size: 12px; color: #CBD5E1; line-height: 1.8;">
+                    • <b>Indicated Horsepower:</b> <span style="color: #F1C40F;">{dynacard['indicated_hp']} HP</span><br>
+                    • <b>Card Work Area:</b> {dynacard['card_area_in_lbs']:,.0f} in-lbs<br>
+                    • <b>Downhole Fluid Load:</b> {dynacard['fluid_load']:,.0f} lbs<br>
+                    • <b>Peak Load (PPRL):</b> {dynacard['pprl']:,.0f} lbs<br>
+                    • <b>Min Load (MPRL):</b> {dynacard['mprl']:,.0f} lbs
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
         col_g1, col_g2 = st.columns(2)
 
@@ -769,46 +915,7 @@ with center_col:
         st.markdown("#### 📊 Field Comparison Across All Baghewala Wells")
         st.caption("Comparing production potential, API gravity, in-situ viscosity, and optimal SPM across all 5 field assets.")
 
-        comparison_records = []
-        for w_id, w_props in WELL_DATABASE.items():
-            # Simulate representative baseline cycle for each well
-            w_sim = simulate_css_cycle(
-                steam_volume=12000.0,
-                spm=6.0,
-                stroke_length=80.0,
-                pump_depth=w_props["depth_m"],
-                reservoir_temp=w_props["reservoir_temp_c"],
-                oil_viscosity=w_props["viscosity_cp"],
-                api_gravity=w_props["api_gravity"]
-            )
-            w_prod = w_sim[w_sim["Phase"] == "Production"]
-            peak_bopd = float(w_prod["Oil_Production"].max())
-            avg_bopd = float(w_prod["Oil_Production"].mean())
-            total_bbl = float(w_prod["Oil_Production"].sum())
-
-            # Recommended SPM proxy based on API gravity
-            if w_props["api_gravity"] < 15.0:
-                rec_spm_str = "4.5 - 5.0"
-            elif w_props["api_gravity"] > 17.5:
-                rec_spm_str = "8.5 - 10.0"
-            else:
-                rec_spm_str = "5.5 - 7.0"
-
-            comparison_records.append({
-                "Well ID": w_id,
-                "Name": w_props["name"],
-                "Depth (m)": w_props["depth_m"],
-                "API Gravity (°)": w_props["api_gravity"],
-                "Viscosity (cP)": w_props["viscosity_cp"],
-                "Reservoir Temp (°C)": w_props["reservoir_temp_c"],
-                "Permeability (mD)": w_props["permeability_md"],
-                "Peak BOPD": np.round(peak_bopd, 1),
-                "Avg BOPD": np.round(avg_bopd, 1),
-                "Cycle Oil (bbl)": np.round(total_bbl, 0),
-                "Safe SPM Range": rec_spm_str
-            })
-
-        comp_df = pd.DataFrame(comparison_records)
+        comp_df = get_field_comparison_data()
 
         # Bar chart comparing predicted oil production
         fig_comp = go.Figure()
@@ -846,6 +953,81 @@ with center_col:
             hide_index=True
         )
 
+    # ------------------------------------------------------------------------
+    # TAB 5: SIMULATION HISTORY & SCADA ALARMS LOG
+    # ------------------------------------------------------------------------
+    with tab5:
+        st.markdown("#### 📜 Field Simulation History & Real-Time SCADA Alarms Log")
+        st.caption("Inspect persisted simulation telemetry, historical well runs, and recorded SCADA event logs.")
+
+        hist_subtab1, hist_subtab2 = st.tabs(["💾 Saved Runs History", "🚨 SCADA Alarm Records"])
+
+        with hist_subtab1:
+            past_runs = get_simulation_history(limit=50)
+            if past_runs:
+                pdf = pd.DataFrame(past_runs)
+                display_cols = [
+                    "id", "timestamp", "steam_volume", "soak_days", "spm",
+                    "stroke_length", "oil_produced", "sor", "rod_load",
+                    "pump_efficiency", "rod_floating"
+                ]
+                available_cols = [c for c in display_cols if c in pdf.columns]
+                st.dataframe(
+                    pdf[available_cols].rename(columns={
+                        "id": "Run ID",
+                        "timestamp": "Timestamp",
+                        "steam_volume": "Steam (bbl)",
+                        "soak_days": "Soak (d)",
+                        "spm": "SPM",
+                        "stroke_length": "Stroke (in)",
+                        "oil_produced": "Oil (bbl)",
+                        "sor": "SOR",
+                        "rod_load": "Peak Load (lbs)",
+                        "pump_efficiency": "Pump Eff (%)",
+                        "rod_floating": "Floating Flag"
+                    }),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                col_h1, col_h2 = st.columns([1, 1])
+                csv_bytes = pdf.to_csv(index=False).encode('utf-8')
+                col_h1.download_button(
+                    "📥 Export History CSV",
+                    csv_bytes,
+                    "baghewala_saved_runs.csv",
+                    "text/csv",
+                    use_container_width=True
+                )
+                if col_h2.button("🗑️ Clear Simulation Runs", use_container_width=True):
+                    clear_simulation_history()
+                    st.success("Simulation runs cleared.")
+                    st.rerun()
+            else:
+                st.info("No saved runs recorded yet. Click '💾 Save Run' in the right panel to persist simulation results.")
+
+        with hist_subtab2:
+            all_alerts = get_alerts(limit=50)
+            if all_alerts:
+                adf = pd.DataFrame(all_alerts)
+                st.dataframe(
+                    adf[["id", "timestamp", "alert_type", "severity", "message"]].rename(columns={
+                        "id": "Alarm ID",
+                        "timestamp": "Timestamp",
+                        "alert_type": "Alert Type",
+                        "severity": "Severity",
+                        "message": "SCADA Description"
+                    }),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                if st.button("🗑️ Clear Alarms Log", use_container_width=True):
+                    clear_alerts()
+                    st.success("Alarms log cleared.")
+                    st.rerun()
+            else:
+                st.info("No active SCADA alarms logged.")
+
+
 
 # ============================================================================
 # RIGHT PANEL: AI INSIGHTS, PREDICTIONS & DYNAMIC ALERTS
@@ -878,8 +1060,8 @@ with right_col:
     """, unsafe_allow_html=True)
 
     if st.button("⚡ Apply AI Recommendation", use_container_width=True):
-        st.session_state.spm_input = opt_spm
-        st.session_state.stroke_input = opt_stroke
+        st.session_state["spm_slider"] = float(opt_spm)
+        st.session_state["stroke_slider"] = float(opt_stroke)
         st.rerun()
 
     # 2. Dynamic Real-Time Alerts Card (Step 5C)
@@ -985,6 +1167,7 @@ with right_col:
                     "rod_floating": int(is_rod_floating)
                 })
                 st.success(f"Saved (ID #{run_id})")
+                st.rerun()
             except Exception as db_err:
                 st.warning(f"Database logging unavailable ({db_err}). Scenario retained in active session.")
 

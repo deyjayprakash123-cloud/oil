@@ -194,9 +194,10 @@ def get_simulation_history(limit: int = 50) -> List[Dict[str, Any]]:
     return rows
 
 
-def save_alert(alert_type: str, message: str, severity: str = "WARNING") -> int:
+def save_alert(alert_type: str, message: str, severity: str = "WARNING", cooldown_seconds: int = 180) -> int:
     """
-    Log warnings and critical alerts.
+    Log warnings and critical alerts with automatic deduplication cooldown
+    to prevent flooding the database on rapid UI reruns or slider movements.
 
     Parameters:
     -----------
@@ -206,14 +207,33 @@ def save_alert(alert_type: str, message: str, severity: str = "WARNING") -> int:
         Descriptive message for engineers
     severity : str
         'INFO', 'WARNING', or 'CRITICAL'
+    cooldown_seconds : int
+        Seconds within which duplicate alerts are skipped (default 180s)
 
     Returns:
     --------
     int
-        Inserted alert ID
+        Inserted or existing alert ID
     """
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    if cooldown_seconds > 0:
+        cursor.execute(
+            "SELECT id, timestamp FROM alerts WHERE alert_type = ? AND message = ? ORDER BY id DESC LIMIT 1",
+            (alert_type, message)
+        )
+        last_alert = cursor.fetchone()
+        if last_alert:
+            try:
+                last_time = datetime.strptime(last_alert["timestamp"], "%Y-%m-%d %H:%M:%S")
+                if (datetime.now() - last_time).total_seconds() < cooldown_seconds:
+                    existing_id = int(last_alert["id"])
+                    conn.close()
+                    return existing_id
+            except Exception:
+                pass
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     cursor.execute("""
@@ -235,6 +255,24 @@ def get_alerts(limit: int = 50) -> List[Dict[str, Any]]:
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
     return rows
+
+
+def clear_alerts():
+    """Clear all recorded alerts from the database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM alerts")
+    conn.commit()
+    conn.close()
+
+
+def clear_simulation_history():
+    """Clear simulation records from the database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM simulations")
+    conn.commit()
+    conn.close()
 
 
 def cleanup_old_records(max_simulations: int = 1000, max_alerts: int = 1000):
@@ -263,3 +301,4 @@ def get_all_wells() -> List[Dict[str, Any]]:
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
     return rows
+

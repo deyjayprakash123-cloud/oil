@@ -202,8 +202,11 @@ def optimize_srp_parameters(
         "confidence": 0.92
     }
 
-    # Evaluate candidates
+    # Pre-build candidate feature matrices for batch evaluation
     candidate_records = []
+    rod_infos = []
+    rf_records = []
+
     for spm in spm_candidates:
         for stroke in stroke_candidates:
             candidate_records.append({
@@ -216,16 +219,6 @@ def optimize_srp_parameters(
                 "API_Gravity": api_gravity
             })
 
-    candidate_df = pd.DataFrame(candidate_records)
-    preds = xgb_model.predict(candidate_df)
-
-    idx = 0
-    for spm in spm_candidates:
-        for stroke in stroke_candidates:
-            pred_prod = float(preds[idx])
-            idx += 1
-
-            # Check rod mechanics with well-specific API gravity and viscosity
             rod_info = calculate_rod_load(
                 spm=spm,
                 stroke_length=stroke,
@@ -233,26 +226,40 @@ def optimize_srp_parameters(
                 pump_depth=pump_depth,
                 api_gravity=api_gravity
             )
+            rod_infos.append(rod_info)
+            rf_records.append({
+                "SPM": spm,
+                "Stroke_Length": stroke,
+                "Viscosity": current_viscosity,
+                "API_Gravity": api_gravity,
+                "Rod_Load": rod_info["PPRL"],
+                "Pump_Depth": pump_depth
+            })
+
+    candidate_df = pd.DataFrame(candidate_records)
+    preds = xgb_model.predict(candidate_df)
+
+    rf_features = pd.DataFrame(rf_records)
+    all_probs = rf_model.predict_proba(rf_features)
+    has_class_1 = len(rf_model.classes_) > 1 and 1 in rf_model.classes_
+    class_1_idx = list(rf_model.classes_).index(1) if has_class_1 else 0
+
+    idx = 0
+    for spm in spm_candidates:
+        for stroke in stroke_candidates:
+            pred_prod = float(preds[idx])
+            rod_info = rod_infos[idx]
 
             pprl = rod_info["PPRL"]
             mprl = rod_info["MPRL"]
             is_floating = rod_info["Rod_Floating_Flag"]
 
-            # Failure risk probability from classifier
-            rf_features = pd.DataFrame([{
-                "SPM": spm,
-                "Stroke_Length": stroke,
-                "Viscosity": current_viscosity,
-                "API_Gravity": api_gravity,
-                "Rod_Load": pprl,
-                "Pump_Depth": pump_depth
-            }])
-            probs = rf_model.predict_proba(rf_features)[0]
-            if len(rf_model.classes_) > 1 and 1 in rf_model.classes_:
-                class_1_idx = list(rf_model.classes_).index(1)
-                fail_prob = float(probs[class_1_idx])
+            if has_class_1:
+                fail_prob = float(all_probs[idx, class_1_idx])
             else:
                 fail_prob = 1.0 if rf_model.classes_[0] == 1 else 0.0
+
+            idx += 1
 
             # Polished rod power proxy
             power_penalty = 0.00035 * (pprl - max(mprl, 0)) * (stroke / 12.0) * spm
@@ -305,7 +312,13 @@ def optimize_srp_parameters(
 # 4. PREDICT FUTURE STATE (7-Day Forecast)
 # ============================================================================
 
-def predict_future_state(simulation_df: pd.DataFrame, days_ahead: int = 7) -> pd.DataFrame:
+def predict_future_state(
+    simulation_df: pd.DataFrame,
+    days_ahead: int = 7,
+    api_gravity: float = 15.5,
+    ref_viscosity: float = 8500.0,
+    ref_temp: float = 48.0
+) -> pd.DataFrame:
     """
     Forecast reservoir temperature, oil production, and rod load for the next
     `days_ahead` days based on the simulation trajectory.
@@ -315,10 +328,30 @@ def predict_future_state(simulation_df: pd.DataFrame, days_ahead: int = 7) -> pd
     pd.DataFrame
         DataFrame with columns: Day, Reservoir_Temp, Oil_Production, Oil_Viscosity, Rod_Load
     """
+    if simulation_df is None or simulation_df.empty:
+        forecast_days = np.arange(1, days_ahead + 1)
+        return pd.DataFrame({
+            "Day": forecast_days,
+            "Reservoir_Temp": np.full(days_ahead, 48.0),
+            "Oil_Production": np.zeros(days_ahead),
+            "Oil_Viscosity": np.full(days_ahead, float(ref_viscosity)),
+            "Rod_Load": np.zeros(days_ahead)
+        })
+
     # Filter to production phase
     prod_data = simulation_df[simulation_df["Phase"] == "Production"].copy()
     if prod_data.empty:
         prod_data = simulation_df.tail(min(30, len(simulation_df))).copy()
+
+    if prod_data.empty:
+        forecast_days = np.arange(1, days_ahead + 1)
+        return pd.DataFrame({
+            "Day": forecast_days,
+            "Reservoir_Temp": np.full(days_ahead, 48.0),
+            "Oil_Production": np.zeros(days_ahead),
+            "Oil_Viscosity": np.full(days_ahead, float(ref_viscosity)),
+            "Rod_Load": np.zeros(days_ahead)
+        })
 
     last_day = int(prod_data["Day"].iloc[-1])
     recent_days = np.arange(len(prod_data))
@@ -327,36 +360,44 @@ def predict_future_state(simulation_df: pd.DataFrame, days_ahead: int = 7) -> pd
 
     # 1. Temperature forecast (exponential decline towards native 48°C)
     temps = prod_data["Reservoir_Temp"].values
-    t_native = 48.0
+    t_native = float(ref_temp) if ref_temp is not None else 48.0
     if len(temps) >= 5 and temps[0] > t_native:
-        # Fit log decay: log(T - 48) ~ a - b*t
+        # Fit log decay: log(T - T_native) ~ a - b*t
         log_diff = np.log(np.maximum(temps - t_native, 0.5))
         poly = np.polyfit(recent_days, log_diff, deg=1)
-        pred_log = poly[0] * future_days_rel + poly[1]
+        # Ensure temperature decay slope is strictly negative (cooling, not heating)
+        decay_slope = min(poly[0], -0.012)
+        pred_log = decay_slope * future_days_rel + poly[1]
         pred_temps = t_native + np.exp(pred_log)
     else:
         # Fallback gentle decline
         last_t = temps[-1] if len(temps) > 0 else 75.0
         pred_temps = [max(last_t - 0.8 * i, t_native) for i in range(1, days_ahead + 1)]
 
-    pred_temps = np.round(np.clip(pred_temps, 48.0, 290.0), 2)
+    pred_temps = np.round(np.clip(pred_temps, t_native, 290.0), 2)
 
     # 2. Viscosity forecast from Arrhenius equation
-    pred_visc = [calculate_oil_viscosity(t) for t in pred_temps]
+    pred_visc = [
+        calculate_oil_viscosity(
+            t, reference_viscosity=ref_viscosity, reference_temp=t_native, api_gravity=api_gravity
+        ) for t in pred_temps
+    ]
     pred_visc = np.round(pred_visc, 2)
 
     # 3. Production forecast (hyperbolic decline)
     oil_rates = prod_data["Oil_Production"].values
     if len(oil_rates) >= 5 and oil_rates[0] > 0:
-        # Fit power law / polynomial
+        # Fit log production decline
         poly_oil = np.polyfit(recent_days, np.log(np.maximum(oil_rates, 1.0)), deg=1)
-        pred_oil_log = poly_oil[0] * future_days_rel + poly_oil[1]
+        # Ensure production decline slope is strictly negative
+        oil_slope = min(poly_oil[0], -0.010)
+        pred_oil_log = oil_slope * future_days_rel + poly_oil[1]
         pred_oil = np.exp(pred_oil_log)
     else:
         last_oil = oil_rates[-1] if len(oil_rates) > 0 else 85.0
-        pred_oil = [max(last_oil * (0.98 ** i), 5.0) for i in range(1, days_ahead + 1)]
+        pred_oil = [max(last_oil * (0.98 ** i), 0.0) for i in range(1, days_ahead + 1)]
 
-    pred_oil = np.round(np.clip(pred_oil, 5.0, 450.0), 2)
+    pred_oil = np.round(np.clip(pred_oil, 0.0, 450.0), 2)
 
     # 4. Rod load forecast based on predicted viscosity
     last_rod = prod_data["Rod_Load"].iloc[-1] if not prod_data.empty else 14500.0

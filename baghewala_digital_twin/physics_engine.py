@@ -384,8 +384,11 @@ def simulate_css_cycle(
             "Steam_Injected": float(np.round(cum_steam, 2)),
             "SOR": 0.0,
             "Rod_Load": 0.0,
+            "MPRL": 0.0,
             "Pump_Efficiency": 0.0,
-            "Rod_Floating_Flag": False
+            "Rod_Floating_Flag": False,
+            "Rod_Floating_Index": 0.0,
+            "Viscous_Drag": 0.0
         })
         current_day += 1
 
@@ -405,8 +408,11 @@ def simulate_css_cycle(
             "Steam_Injected": float(np.round(cum_steam, 2)),
             "SOR": 0.0,
             "Rod_Load": 0.0,
+            "MPRL": 0.0,
             "Pump_Efficiency": 0.0,
-            "Rod_Floating_Flag": False
+            "Rod_Floating_Flag": False,
+            "Rod_Floating_Index": 0.0,
+            "Viscous_Drag": 0.0
         })
         current_day += 1
 
@@ -434,7 +440,13 @@ def simulate_css_cycle(
 
         thermal_visc_factor = (100.0 / max(visc_curr, 10.0)) ** 0.38
         time_decline = (1.0 + 0.5 * 0.02 * d) ** (-2.0)
-        daily_oil = float(np.clip(peak_production_bopd * thermal_visc_factor * time_decline, 5.0, theoretical_disp_bpd * 0.95))
+
+        if theoretical_disp_bpd <= 0.0:
+            daily_oil = 0.0
+        else:
+            max_oil = theoretical_disp_bpd * 0.95
+            oil_calc = peak_production_bopd * thermal_visc_factor * time_decline
+            daily_oil = float(np.clip(oil_calc, 0.0, max_oil))
 
         cum_oil += daily_oil
         sor = calculate_steam_oil_ratio(cum_oil, cum_steam)
@@ -459,3 +471,145 @@ def simulate_css_cycle(
 
     df = pd.DataFrame(records)
     return df
+
+
+# ============================================================================
+# 7. SUCKER ROD PUMP DYNACARD GENERATOR (API RP 11L)
+# ============================================================================
+
+def generate_dynacard(
+    stroke_length: float = 80.0,
+    spm: float = 6.0,
+    pump_depth: float = 1000.0,
+    rod_diameter: float = 1.0,
+    fluid_viscosity: float = 100.0,
+    api_gravity: float = 15.5,
+    num_points: int = 100
+) -> Dict[str, Any]:
+    """
+    Generate realistic API RP 11L Surface and Downhole Dynamometer Cards (Dynacards)
+    for Sucker Rod Pump operations in heavy oil.
+
+    Models:
+    - Kinematic polished rod displacement x(theta) = (S/2) * (1 - cos(theta))
+    - Dynamic load pickup on upstroke and load release on downstroke
+    - Viscous drag distortion and rod floating compressive collapse
+    - Downhole pump card (effective pump stroke Sp, fluid load Fo)
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Coordinates and diagnostics for plotting.
+    """
+    rod_info = calculate_rod_load(
+        spm=spm,
+        stroke_length=stroke_length,
+        fluid_viscosity=fluid_viscosity,
+        pump_depth=pump_depth,
+        rod_diameter=rod_diameter,
+        api_gravity=api_gravity
+    )
+
+    pprl = rod_info["PPRL"]
+    mprl = rod_info["MPRL"]
+    is_floating = rod_info["Rod_Floating_Flag"]
+    visc_drag = rod_info["Viscous_Drag"]
+    alpha = rod_info["Acceleration_Factor"]
+
+    depth_ft = pump_depth * 3.28084
+    oil_sg = 141.5 / (api_gravity + 131.5)
+    mixed_sg = 0.65 * oil_sg + 0.35 * 1.02
+    fluid_gradient_psi_ft = 0.433 * mixed_sg
+    d_plunger_in = 2.25
+    a_plunger_sq_in = (np.pi / 4.0) * (d_plunger_in ** 2)
+    fluid_load = fluid_gradient_psi_ft * depth_ft * a_plunger_sq_in
+
+    # Angles around cycle [0, 2*pi]
+    thetas = np.linspace(0, 2 * np.pi, num_points)
+    positions = []
+    surface_loads = []
+    pump_positions = []
+    pump_loads = []
+
+    # Downhole rod stretch (elastic elongation under fluid load)
+    # Rod area: A_r = pi/4 * d^2, Steel modulus E = 30e6 psi
+    rod_area = (np.pi / 4.0) * (rod_diameter ** 2)
+    rod_stretch_in = (fluid_load * depth_ft * 12.0) / (rod_area * 30e6)
+    downhole_stroke = max(stroke_length - rod_stretch_in, 10.0)
+
+    half_stroke = stroke_length / 2.0
+    half_dh_stroke = downhole_stroke / 2.0
+    stroke_offset = (stroke_length - downhole_stroke) / 2.0
+
+    for theta in thetas:
+        # Polished rod kinematics
+        x_surf = half_stroke * (1.0 - np.cos(theta))
+        positions.append(float(np.round(x_surf, 2)))
+
+        if theta <= np.pi:
+            # UPSTROKE (theta from 0 to pi)
+            t_ratio = min(1.0, theta / 0.55)
+            # Dynamic elastic pickup
+            load_baseline = mprl + (pprl - mprl) * (t_ratio ** 0.85)
+            # Sucker rod natural frequency harmonic wave
+            harmonic = 0.04 * (pprl - mprl) * np.sin(4.0 * theta) * np.exp(-0.8 * theta)
+            s_load = load_baseline + harmonic
+            surface_loads.append(float(np.round(s_load, 1)))
+
+            # Downhole pump card (upstroke picks up fluid load)
+            p_ratio = min(1.0, theta / 0.35)
+            p_pos = stroke_offset + half_dh_stroke * (1.0 - np.cos(theta))
+            p_load = fluid_load * (p_ratio ** 1.5)
+            pump_positions.append(float(np.round(p_pos, 2)))
+            pump_loads.append(float(np.round(p_load, 1)))
+        else:
+            # DOWNSTROKE (theta from pi to 2*pi)
+            phi = theta - np.pi
+            t_ratio = min(1.0, phi / 0.55)
+            load_baseline = pprl - (pprl - mprl) * (t_ratio ** 0.85)
+            harmonic = -0.03 * (pprl - mprl) * np.sin(4.0 * phi) * np.exp(-0.8 * phi)
+            s_load = load_baseline + harmonic
+
+            # If rod is floating, compressive viscous drag causes lower boundary collapse
+            if is_floating or mprl <= 0:
+                s_load = max(s_load * 0.45, 0.0)
+
+            surface_loads.append(float(np.round(s_load, 1)))
+
+            # Downhole pump card (downstroke dumps fluid load to standing valve)
+            p_ratio = min(1.0, phi / 0.35)
+            p_pos = stroke_offset + half_dh_stroke * (1.0 - np.cos(theta))
+            p_load = fluid_load * (1.0 - (p_ratio ** 1.5))
+            pump_positions.append(float(np.round(p_pos, 2)))
+            pump_loads.append(float(np.round(p_load, 1)))
+
+    # Compute card area via trapezoidal numerical integration (in-lbs)
+    dx = np.diff(positions)
+    avg_load = 0.5 * (np.array(surface_loads[:-1]) + np.array(surface_loads[1:]))
+    card_area_in_lbs = float(np.abs(np.sum(avg_load * dx)))
+    indicated_hp = float(np.round((card_area_in_lbs * max(spm, 0.0)) / (12.0 * 33000.0), 2))
+
+    # Diagnostic categorization
+    if is_floating or mprl <= 0.0:
+        diagnostic = "Severe Rod Floating (Viscous Retardation on Downstroke)"
+    elif pprl > 22000.0:
+        diagnostic = "Excessive Rod Tensile Stress (Approaching Grade D Fatigue Limit)"
+    elif visc_drag > 2500.0:
+        diagnostic = "High Viscous Drag (Heavy Crude Damping)"
+    else:
+        diagnostic = "Normal Full Pump Card (Optimal API RP 11L Compliance)"
+
+    return {
+        "surface_position": positions,
+        "surface_load": surface_loads,
+        "pump_position": pump_positions,
+        "pump_load": pump_loads,
+        "pprl": pprl,
+        "mprl": mprl,
+        "fluid_load": float(np.round(fluid_load, 1)),
+        "card_area_in_lbs": float(np.round(card_area_in_lbs, 1)),
+        "indicated_hp": indicated_hp,
+        "diagnostic": diagnostic,
+        "is_rod_floating": is_floating
+    }
+

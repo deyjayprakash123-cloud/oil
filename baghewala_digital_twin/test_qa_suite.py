@@ -49,11 +49,25 @@ sor_zero = pe.calculate_steam_oil_ratio(0.0, 10000.0)
 results.append(('Test 2.4: Steam-Oil Ratio Calculations', sor_norm == 20.0 and np.isinf(sor_zero), f'sor_norm={sor_norm}, sor_zero={sor_zero}'))
 
 sim_df = pe.simulate_css_cycle(steam_volume=10000.0, spm=8.0, soak_days=5, production_days=60, reservoir_temp=47.0, oil_viscosity=7800.0, api_gravity=15.8, pump_depth=1020.0)
-cols = ['Day', 'Phase', 'Reservoir_Temp', 'Oil_Viscosity', 'Oil_Production', 'Steam_Injected', 'SOR', 'Rod_Load', 'Pump_Efficiency', 'Rod_Floating_Flag']
+cols = ['Day', 'Phase', 'Reservoir_Temp', 'Oil_Viscosity', 'Oil_Production', 'Steam_Injected', 'SOR', 'Rod_Load', 'MPRL', 'Pump_Efficiency', 'Rod_Floating_Flag']
 cols_ok = all(c in sim_df.columns for c in cols)
 phases_ok = set(sim_df['Phase'].unique()) == {'Injection', 'Soak', 'Production'}
 inj_prod_zero = (sim_df[sim_df['Phase'].isin(['Injection', 'Soak'])]['Oil_Production'] == 0).all()
 results.append(('Test 2.5: CSS Simulation Cycle Trajectory', cols_ok and phases_ok and inj_prod_zero and len(sim_df) >= 60, f'rows={len(sim_df)}, phases={list(sim_df["Phase"].unique())}'))
+
+# Test 2.6: Dynacard Generation
+dyna_normal = pe.generate_dynacard(80.0, 6.0, 1020.0, 1.0, 120.0, 15.8)
+dyna_float = pe.generate_dynacard(80.0, 8.0, 980.0, 1.0, 9500.0, 14.5)
+dyna_ok = (
+    len(dyna_normal["surface_position"]) == 100 and
+    len(dyna_normal["pump_position"]) == 100 and
+    dyna_normal["indicated_hp"] > 0 and
+    dyna_normal["card_area_in_lbs"] > 0 and
+    not dyna_normal["is_rod_floating"] and
+    dyna_float["is_rod_floating"] and
+    "Rod Floating" in dyna_float["diagnostic"]
+)
+results.append(('Test 2.6: API RP 11L Dynacard Generation & Diagnostics', dyna_ok, f'IHP={dyna_normal["indicated_hp"]} HP, Normal Diag="{dyna_normal["diagnostic"]}", Float Diag="{dyna_float["diagnostic"]}'))
 
 # Step 3: AI Optimizer
 opt_bg01 = ai.optimize_srp_parameters(7800.0, 47.0, 1020.0, 15.8)
@@ -62,9 +76,11 @@ opt_bg07 = ai.optimize_srp_parameters(9500.0, 48.5, 980.0, 14.5)
 spm_bg01_ok = 4.0 <= opt_bg01['optimal_spm'] <= 8.0
 spm_bg15_ok = 8.0 <= opt_bg15['optimal_spm'] <= 10.0
 spm_bg07_ok = 4.0 <= opt_bg07['optimal_spm'] <= 5.0
-pred_future = ai.predict_future_state(sim_df)
+pred_future = ai.predict_future_state(sim_df, days_ahead=7, api_gravity=15.8, ref_viscosity=7800.0, ref_temp=47.0)
 pred_ok = len(pred_future) == 7 and (pred_future['Oil_Production'] >= 0).all()
-results.append(('Step 3: AI Optimizer & Forecaster', spm_bg01_ok and spm_bg15_ok and spm_bg07_ok and pred_ok, f'BG-01 SPM={opt_bg01["optimal_spm"]}, BG-15 SPM={opt_bg15["optimal_spm"]}, BG-07 SPM={opt_bg07["optimal_spm"]}'))
+empty_forecast = ai.predict_future_state(pd.DataFrame(), days_ahead=7)
+empty_forecast_ok = len(empty_forecast) == 7 and (empty_forecast['Oil_Production'] == 0).all()
+results.append(('Step 3: AI Optimizer & Forecaster Resilience', spm_bg01_ok and spm_bg15_ok and spm_bg07_ok and pred_ok and empty_forecast_ok, f'BG-01 SPM={opt_bg01["optimal_spm"]}, BG-15 SPM={opt_bg15["optimal_spm"]}, BG-07 SPM={opt_bg07["optimal_spm"]}, Empty DF Handled={empty_forecast_ok}'))
 
 # Step 4: Data Generator
 css_data = dg.generate_css_cycle_data(1000)
@@ -88,9 +104,11 @@ dummy_sim = {
 }
 db.save_simulation(dummy_sim)
 hist = db.get_simulation_history(limit=5)
-db.save_alert('WARNING', 'Test QA Alert for Baghewala Field', 'WARNING')
+id1 = db.save_alert('WARNING', 'Test QA Alert for Baghewala Field', 'WARNING')
+id2 = db.save_alert('WARNING', 'Test QA Alert for Baghewala Field', 'WARNING')
 alerts = db.get_alerts(limit=5)
-results.append(('Step 6: SQLite Database Ops & Ring Buffer', len(hist) > 0 and len(alerts) > 0, f'hist_count={len(hist)}, alert_count={len(alerts)}'))
+dedup_ok = (id1 == id2)
+results.append(('Step 6: SQLite Database Ops & Alert Deduplication', len(hist) > 0 and len(alerts) > 0 and dedup_ok, f'hist_count={len(hist)}, alert_count={len(alerts)}, deduplicated={dedup_ok}'))
 
 # Step 8: Error handling
 sim_zero_steam = pe.simulate_css_cycle(steam_volume=0.0, spm=8.0, soak_days=5, production_days=60, reservoir_temp=47.0, oil_viscosity=7800.0)
